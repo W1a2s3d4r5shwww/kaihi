@@ -17,5 +17,8 @@
   "dependencies": {
     "@tomphttp/bare-server-node": "1.0.4-deps1",
     "serve-static": "^1.15.0"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }
