@@ -1,169 +1,144 @@
-// Proposed replacement for index.js
-import createServer from '@tomphttp/bare-server-node';
-import { fileURLToPath } from "url";
-import http from 'http';
-import serveStatic from "serve-static";
-import { pipeline } from 'stream';
-import { promisify } from 'util';
-import { Buffer } from 'buffer';
+// Server.js
+import express from "express";
+import axios from "axios";
+import helmet from "helmet";
+import cors from "cors";
+import morgan from "morgan";
+import dotenv from "dotenv";
+import { register, collectDefaultMetrics, Counter, Histogram } from "prom-client";
+import { URL } from "url";
 
-const streamPipeline = promisify(pipeline);
+dotenv.config();
 
-// The following message MAY NOT be removed
-console.log("Incognito\nThis program comes with ABSOLUTELY NO WARRANTY.\nThis is free software, and you are welcome to redistribute it\nunder the terms of the GNU General Public License as published...");
+// =====================
+// 基本設定
+// =====================
+const app = express();
+const PORT = process.env.PORT || 3000;
+const REQUEST_TIMEOUT = Number(process.env.REQUEST_TIMEOUT) || 5000;
+const WHITELIST = (process.env.WHITELIST || "").split(",").filter(Boolean);
 
-const port = process.env.PORT || 8080;
-const bare = createServer('/bare/');
-const serve = serveStatic(fileURLToPath(new URL("./static/", import.meta.url)), { fallthrough: false });
-const server = http.createServer();
+// =====================
+// ミドルウェア
+// =====================
+app.use(express.json({ limit: "2mb" }));
+app.use(cors({ origin: process.env.CORS_ORIGIN || "*" }));
+app.use(morgan("combined"));
+app.use(helmet());
 
-function isHopByHopHeader(name) {
-  const hopByHop = [
-    'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
-    'te', 'trailer', 'transfer-encoding', 'upgrade'
-  ];
-  return hopByHop.includes(name.toLowerCase());
+// =====================
+// メトリクス設定（Prometheus）
+// =====================
+collectDefaultMetrics();
+const requestCounter = new Counter({
+  name: "proxy_requests_total",
+  help: "Total number of proxy requests",
+});
+const requestDuration = new Histogram({
+  name: "proxy_request_duration_seconds",
+  help: "Proxy request duration in seconds",
+  buckets: [0.1, 0.5, 1, 2, 5, 10],
+});
+
+// =====================
+// Graceful shutdown
+// =====================
+let shuttingDown = false;
+const server = app.listen(PORT, () => console.log(`Proxy running on port ${PORT}`));
+
+function gracefulShutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log("Server shutting down...");
+  server.close(() => {
+    console.log("Server closed.");
+    process.exit(0);
+  });
 }
 
-/**
- * Decode a base64 part or query parameter to target url.
- * Supports:
- *  - /p/<base64url>
- *  - /p/?link=<base64url>
- */
-function decodeTargetUrl(reqUrl) {
+process.on("SIGINT", gracefulShutdown);
+process.on("SIGTERM", gracefulShutdown);
+
+// =====================
+// ユーティリティ
+// =====================
+function isValidUrl(input) {
   try {
-    const u = new URL(reqUrl, `http://${req.headers.host}`);
-    // query param ?link=base64(...)
-    if (u.searchParams.has('link')) {
-      const b = u.searchParams.get('link');
-      return Buffer.from(b, 'base64').toString('utf8');
-    }
-    // path /p/<base64>
-    const parts = u.pathname.split('/');
-    if (parts.length >= 3 && parts[1] === 'p') {
-      const b = parts.slice(2).join('/');
-      return Buffer.from(b, 'base64').toString('utf8');
-    }
-  } catch (e) {}
-  return null;
+    const urlObj = new URL(input);
+    return ["http:", "https:"].includes(urlObj.protocol);
+  } catch {
+    return false;
+  }
 }
 
-server.on('request', async (req, res) => {
+function isAllowed(url) {
+  if (!WHITELIST.length) return true; // ホワイトリスト空ならすべて許可
+  return WHITELIST.some(domain => url.startsWith(domain));
+}
+
+// =====================
+// ルート
+// =====================
+app.post("/proxy", async (req, res) => {
+  if (shuttingDown) return res.status(503).json({ error: "Server shutting down" });
+
+  const start = Date.now();
+  requestCounter.inc();
+
+  const { url, method = "GET", headers = {}, data } = req.body;
+
+  if (!url || !isValidUrl(url)) {
+    return res.status(400).json({ error: "Invalid or missing URL" });
+  }
+  if (!isAllowed(url)) {
+    return res.status(403).json({ error: "URL not allowed" });
+  }
+
   try {
-    // let bare-server handle WebSocket upgrade routes and similar
-    if (bare.shouldRoute(req)) {
-      return bare.routeRequest(req, res);
-    }
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
 
-    // Handle proxy route: paths starting with /p/ or query '?link='
-    if (req.url && (req.url.startsWith('/p/') || req.includes && req.includes('link='))) {
-      const target = decodeTargetUrl(req.url);
-      if (!target) {
-        res.writeHead(400, { 'Content-Type': 'text/plain' });
-        return res.end('Bad proxy request');
-      }
-
-      // Build headers for upstream fetch: copy incoming headers, but remove hop-by-hop ones
-      const upstreamHeaders = {};
-      for (const [k, v] of Object.entries(req.headers)) {
-        if (isHopByHopHeader(k)) continue;
-        // do not forward host header, let fetch set it
-        if (k.toLowerCase() === 'host') continue;
-        upstreamHeaders[k] = v;
-      }
-
-      // Use global fetch (Node >=18). Forward method and body.
-      const init = {
-        method: req.method,
-        headers: upstreamHeaders,
-        // body: stream only for non-GET methods
-      };
-
-      if (req.method !== 'GET' && req.method !== 'HEAD' && req.method !== 'OPTIONS') {
-        init.body = req;
-      }
-
-      const upstreamRes = await fetch(target, init);
-
-      // Copy status
-      const status = upstreamRes.status;
-
-      // Copy headers excluding hop-by-hop and set-cookie handling
-      const outHeaders = {};
-      upstreamRes.headers.forEach((value, name) => {
-        if (isHopByHopHeader(name)) return;
-        // We explicitly forward set-cookie headers as-is (some libs combine them)
-        outHeaders[name] = value;
-      });
-
-      // If there are multiple Set-Cookie headers, ensure they are forwarded individually
-      // The Fetch API may combine them; try to get raw headers if possible
-      // For typical cases, the above is sufficient.
-
-      // Write response headers and status
-      res.writeHead(status, outHeaders);
-
-      // Stream body: prefer piping the ReadableStream -> Node stream
-      if (upstreamRes.body) {
-        // Node 18+: readable Web stream -> Node Readable
-        if (typeof (streamPipeline) !== 'undefined' && typeof upstreamRes.body.getReader === 'function') {
-          // Convert WHATWG stream to Node stream and pipe
-          const nodeReadable = (await import('stream')).Readable.fromWeb
-            ? (await import('stream')).Readable.fromWeb(upstreamRes.body)
-            : null;
-
-          if (nodeReadable) {
-            await streamPipeline(nodeReadable, res);
-            return;
-          }
-        }
-
-        // Fallback: read as ArrayBuffer chunks and write
-        const reader = upstreamRes.body.getReader();
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          if (!value) continue;
-          // value is Uint8Array
-          res.write(Buffer.from(value));
-        }
-        return res.end();
-      } else {
-        // No body
-        return res.end();
-      }
-    }
-
-    // Otherwise serve static
-    serve(req, res, (err) => {
-      res.writeHead(err?.statusCode || 500, null, {
-        "Content-Type": "text/plain",
-      });
-      res.end(err?.stack || String(err));
+    const response = await axios({
+      url,
+      method,
+      headers,
+      data,
+      signal: controller.signal,
+      validateStatus: null, // ステータスコードに関係なく返す
     });
-  } catch (e) {
-    console.error('Proxy error:', e);
-    res.writeHead(502, { 'Content-Type': 'text/plain' });
-    res.end('Bad Gateway: ' + (e && e.message));
+
+    clearTimeout(timeoutId);
+    requestDuration.observe((Date.now() - start) / 1000);
+
+    // 安全に返す
+    res.status(response.status).json({
+      status: response.status,
+      headers: response.headers,
+      data: response.data,
+    });
+  } catch (err) {
+    requestDuration.observe((Date.now() - start) / 1000);
+    if (err.name === "AbortError") return res.status(504).json({ error: "Request timed out" });
+    console.error(err);
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
-server.on('upgrade', (req, socket, head) => {
-  if (bare.shouldRoute(req, socket, head)) {
-    bare.routeUpgrade(req, socket, head);
-  } else {
-    socket.end();
+// =====================
+// メトリクスエンドポイント
+// =====================
+app.get("/metrics", async (req, res) => {
+  try {
+    res.set("Content-Type", register.contentType);
+    res.end(await register.metrics());
+  } catch (err) {
+    res.status(500).end(err);
   }
 });
 
-// Increase timeouts so long downloads / streaming do not cut at ~10s
-server.keepAliveTimeout = 120 * 1000; // 2 minutes
-server.headersTimeout = 130 * 1000;
-server.setTimeout(120 * 1000);
+// =====================
+// ヘルスチェック
+// =====================
+app.get("/health", (req, res) => res.json({ status: "ok" }));
 
-server.listen({
-  port: port,
-});
-
-console.log("Server running on port " + port);
+export default server;
